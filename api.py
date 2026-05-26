@@ -2,7 +2,7 @@
 # export SENSEVOICE_DEVICE=cuda:1
 
 import os, re
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, Query
 from fastapi.responses import HTMLResponse
 from typing_extensions import Annotated
 from typing import List
@@ -11,6 +11,7 @@ import torchaudio
 from model import SenseVoiceSmall
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
+from corrector import get_corrector
 
 TARGET_FS = 16000
 
@@ -26,8 +27,14 @@ class Language(str, Enum):
 
 
 model_dir = "iic/SenseVoiceSmall"
-m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"))
+m, kwargs = SenseVoiceSmall.from_pretrained(
+    model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "cuda:0")
+)
 m.eval()
+
+# 初始化纠错器（启动时加载，避免每次请求都加载）
+corrector_backend = os.getenv("CORRECTOR_BACKEND", "dictionary")
+corrector = get_corrector(backend=corrector_backend)
 
 regex = r"<\|.*\|>"
 
@@ -55,6 +62,7 @@ async def turn_audio_to_text(
     files: Annotated[List[UploadFile], File(description="wav or mp3 audios in 16KHz")],
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
+    correct: Annotated[bool, Query(description="enable text correction post-processing")] = True,
 ):
     audios = []
     for file in files:
@@ -63,7 +71,9 @@ async def turn_audio_to_text(
 
         # transform to target sample
         if audio_fs != TARGET_FS:
-            resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=audio_fs, new_freq=TARGET_FS
+            )
             data_or_path_or_list = resampler(data_or_path_or_list)
 
         data_or_path_or_list = data_or_path_or_list.mean(0)
@@ -79,19 +89,28 @@ async def turn_audio_to_text(
 
     res = m.inference(
         data_in=audios,
-        language=lang,  # "zh", "en", "yue", "ja", "ko", "nospeech"
-        use_itn=False,
+        language=lang,
+        use_itn=True,  # 启用逆文本正则化（白嫖的纠错）
         ban_emo_unk=False,
         key=key,
         fs=TARGET_FS,
         **kwargs,
     )
+
     if len(res) == 0:
         return {"result": []}
+
     for it in res[0]:
         it["raw_text"] = it["text"]
         it["clean_text"] = re.sub(regex, "", it["text"], 0, re.MULTILINE)
         it["text"] = rich_transcription_postprocess(it["text"])
+
+        # 文本后处理纠错
+        if correct and lang in ("zh", "auto"):
+            correction = corrector.correct(it["text"])
+            it["corrected_text"] = correction["corrected"]
+            it["corrections"] = correction["changes"]
+
     return {"result": res[0]}
 
 
