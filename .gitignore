@@ -26,3 +26,5 @@ emotion2vec*
 GPT-SoVITS*
 modelscope_models
 examples/aishell/llm_asr_nar/*
+test_hengshui.sh
+hengshui_audio/
