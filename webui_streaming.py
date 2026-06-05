@@ -1,8 +1,8 @@
 # coding=utf-8
 """
-SenseVoice 流式转译 Web UI
-- 支持上传音频文件或麦克风输入
-- 逐段实时输出字幕（相当于实时转译效果）
+SenseVoice 流式转译 Web UI — 真流式版
+- VAD 先分段 → 逐段 ASR → 逐段 yield
+- 消除批量 generate() 的长等待
 - 用法: python webui_streaming.py
 """
 
@@ -15,10 +15,13 @@ from funasr import AutoModel
 
 # ========== 加载模型 ==========
 print("⏳ 加载 SenseVoice + VAD...")
-model = AutoModel(
+asr_model = AutoModel(
     model="iic/SenseVoiceSmall",
-    vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-    vad_kwargs={"max_single_segment_time": 30000},
+    trust_remote_code=True,
+    device="cpu",
+)
+vad_model = AutoModel(
+    model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
     trust_remote_code=True,
     device="cpu",
 )
@@ -107,11 +110,12 @@ def preprocess_audio(input_wav):
             input_wav = resampler(input_wav_t[None, :])[0, :].numpy()
     return input_wav
 
-# ========== 核心：流式识别 ==========
+# ========== 核心：真流式识别 ==========
 def stream_inference(input_wav, language):
     """
-    流式语音转文字
-    用 SenseVoice + VAD 精准分段 → 逐段输出
+    真流式语音转文字
+    Step 1: VAD 分段 → 获取语音时间戳
+    Step 2: 逐段 ASR → 每段识别完立刻 yield
     """
     audio = preprocess_audio(input_wav)
     duration = len(audio) / 16000
@@ -123,46 +127,60 @@ def stream_inference(input_wav, language):
     language_map = {"auto": "auto", "zh": "zh", "en": "en", "yue": "yue", "ja": "ja", "ko": "ko", "nospeech": "nospeech"}
     lang = language_map.get(language, "auto")
     
-    # 用 VAD 分段识别
+    # Step 1: VAD 分段
     try:
-        raw_results = model.generate(
-            input=audio,
-            language=lang,
-            use_itn=True,
-            batch_size_s=60,
-            merge_vad=True,
-        )
+        vad_result = vad_model.generate(input=audio)
     except Exception as e:
-        yield f"❌ 识别失败: {e}"
+        yield f"❌ VAD 分段失败: {e}"
         return
     
-    if not raw_results:
+    # 提取语音段的时间戳
+    segments = []
+    if vad_result and len(vad_result) > 0:
+        for item in vad_result[0].get("value", []):
+            start_ms = item[0]
+            end_ms = item[1]
+            start_sample = int(start_ms / 1000 * 16000)
+            end_sample = int(end_ms / 1000 * 16000)
+            if end_sample - start_sample > 8000:  # 至少 0.5 秒
+                segments.append((start_sample, end_sample))
+    
+    if not segments:
         yield "⚠️ 未检测到语音内容"
         return
     
-    # 逐段输出（模拟实时字幕）
-    segments = []
-    total_segs = len(raw_results)
+    # Step 2: 逐段 ASR + 实时 yield
+    texts = []
+    total_segs = len(segments)
     
-    for i, seg in enumerate(raw_results):
-        text = seg.get("text", "")
-        text = format_str_v3(text)
-        if text.strip():
-            segments.append(text)
+    for i, (start, end) in enumerate(segments):
+        seg_audio = audio[start:end]
         
-        # 构建累积文本
-        combined = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(segments))
+        try:
+            asr_result = asr_model.generate(
+                input=seg_audio,
+                language=lang,
+                use_itn=True,
+                batch_size_s=60,
+            )
+        except Exception as e:
+            yield f"❌ 第 {i+1} 段识别失败: {e}"
+            continue
         
-        # 添加进度和时长信息
-        header = f"🎙️ 实时转译中... ({i+1}/{total_segs} 段)"
-        yield f"{header}\n{'─'*40}\n{combined}\n{'─'*40}\n⏱️ 总时长: {duration:.1f}秒"
+        if asr_result and len(asr_result) > 0:
+            text = asr_result[0].get("text", "")
+            text = format_str_v3(text)
+            if text.strip():
+                texts.append(text)
         
-        # 模拟流式延迟（可选，让字幕更有"实时"感）
-        time.sleep(0.15)
+        # 构建累积输出
+        combined = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(texts))
+        seg_dur = (end - start) / 16000
+        yield f"🎙️ 实时转译中... ({i+1}/{total_segs} 段, {seg_dur:.1f}s)\n{'─'*40}\n{combined}\n{'─'*40}\n⏱️ 总时长: {duration:.1f}秒"
     
     # 最终结果
-    final = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(segments))
-    yield f"✅ 转译完成（共 {total_segs} 段 | {duration:.1f}秒）\n{'─'*40}\n{final}"
+    final = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(texts))
+    yield f"✅ 转译完成（共 {len(texts)} 段 | {duration:.1f}秒）\n{'─'*40}\n{final}"
 
 # ========== Gradio UI ==========
 HTML_STREAMING = """
