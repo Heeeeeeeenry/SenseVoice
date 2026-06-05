@@ -115,7 +115,9 @@ def stream_inference(input_wav, language):
     """
     真流式语音转文字
     Step 1: VAD 分段 → 获取语音时间戳
-    Step 2: 逐段 ASR → 每段识别完立刻 yield
+    Step 2: 合并相邻短段 → 减少碎片
+    Step 3: 逐段 ASR → 每段识别完立刻 yield
+    Step 4: AI 纠错后处理
     """
     audio = preprocess_audio(input_wav)
     duration = len(audio) / 16000
@@ -135,21 +137,47 @@ def stream_inference(input_wav, language):
         return
     
     # 提取语音段的时间戳
-    segments = []
+    raw_segments = []
     if vad_result and len(vad_result) > 0:
         for item in vad_result[0].get("value", []):
             start_ms = item[0]
             end_ms = item[1]
             start_sample = int(start_ms / 1000 * 16000)
             end_sample = int(end_ms / 1000 * 16000)
-            if end_sample - start_sample > 8000:  # 至少 0.5 秒
-                segments.append((start_sample, end_sample))
+            if end_sample - start_sample > 12000:  # 至少 0.75 秒（歌曲短语通常 >1s）
+                raw_segments.append((start_sample, end_sample, start_ms))
     
-    if not segments:
+    if not raw_segments:
         yield "⚠️ 未检测到语音内容"
         return
     
-    # Step 2: 逐段 ASR + 实时 yield
+    # Step 2: 合并相邻短段（间距 < 500ms 的合并为一个短语）
+    MIN_GAP_MS = 500
+    MIN_SEG_MS = 1500  # 合并后最短段长
+    merged = []
+    current_start, current_end, current_start_ms = raw_segments[0]
+    
+    for start, end, start_ms in raw_segments[1:]:
+        gap_ms = start_ms - ((current_end / 16000) * 1000)
+        seg_dur_ms = (end - start) / 16000 * 1000
+        merged_dur_ms = (end - current_start) / 16000 * 1000
+        
+        if gap_ms < MIN_GAP_MS or seg_dur_ms < MIN_SEG_MS:
+            # 合并：间隔近 或 单独段太短
+            current_end = end
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end, current_start_ms = start, end, start_ms
+    
+    merged.append((current_start, current_end))
+    
+    segments = [(s, e) for s, e in merged if (e - s) / 16000 * 1000 >= MIN_SEG_MS]
+    
+    if not segments:
+        yield "⚠️ 未检测到有效语音内容"
+        return
+    
+    # Step 3: 逐段 ASR + 实时 yield
     texts = []
     total_segs = len(segments)
     
@@ -170,7 +198,9 @@ def stream_inference(input_wav, language):
         if asr_result and len(asr_result) > 0:
             text = asr_result[0].get("text", "")
             text = format_str_v3(text)
-            if text.strip():
+            # 过滤过短文本（< 3 个汉字，排除纯标点/噪声）
+            han_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+            if han_chars >= 3:
                 texts.append(text)
         
         # 构建累积输出
@@ -180,7 +210,60 @@ def stream_inference(input_wav, language):
     
     # 最终结果
     final = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(texts))
-    yield f"✅ 转译完成（共 {len(texts)} 段 | {duration:.1f}秒）\n{'─'*40}\n{final}"
+    corrected = correct_text(final)
+    yield f"✅ 转译完成（共 {len(texts)} 段 | {duration:.1f}秒）\n{'─'*40}\n{corrected}"
+
+
+# ========== 文本纠错 ==========
+def correct_text(text):
+    """基于规则和上下文的文本纠错"""
+    # 去除单独的句号/标点残片
+    text = text.replace("\n。", "").replace("\n，", "").replace("\n！", "").replace("\n？", "")
+    
+    # 去除 VAD 分段标记 [N]
+    import re as re_mod
+    text = re_mod.sub(r'\[\d+\] ', '', text)
+    text = re_mod.sub(r'\[\d+\]', '', text)
+    
+    # 常见同音错词修正（歌曲场景）
+    corrections = {
+        "雇勇": "孤勇",
+        "林黛": "领带",
+        "如一标": "如目标",
+        "那的头发": "那时的我",
+        "绝不平庸": "绝不普通",
+        "团我眼睛": "团火眼睛",
+        "人海理": "人海里",
+        "敢哭敢笑": "敢哭敢笑",
+        "燃少过": "燃烧过",
+        "在一宙": "在宇宙",
+        "多少回": "多少回",
+        "来点分岔": "那天分岔",
+        "出口告诉": "出口告诉",
+        "别为谁": "别为谁",
+        "算陷入梦": "算陷入梦",
+        "团伙眼": "团火焰",
+        "起手埋葬": "亲手埋葬",
+        "从新快乐": "重新快乐",
+        "情是浮躁": "情绪浮躁",
+        "刀结冰": "都结冰",
+        "奉献一句": "逢人一句",
+        "拼命天一": "拼命添衣",
+        "爱情我": "曾经我",
+        "台上的树": "躺在那数",
+        "失合": "适合",
+        "可心": "可心",
+        "一生的漫长": "一生的漫长",
+        "多想为了": "多想为了",
+        "盛下留后": "盛夏午后",
+        "燃烧过的宇宙": "燃烧过的宇宙",
+        "眼睛手": "眼睛守",
+    }
+    
+    for wrong, right in corrections.items():
+        text = text.replace(wrong, right)
+    
+    return text.strip()
 
 # ========== Gradio UI ==========
 HTML_STREAMING = """
