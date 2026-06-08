@@ -18,12 +18,8 @@ RUN pip install --no-cache-dir torch==2.3.0 torchaudio==2.3.0 --index-url https:
 
 COPY . .
 
-RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser \
-    && mkdir -p /models /tmp/gradio \
-    && chown -R appuser:appuser /app /models /tmp/gradio
-
-USER appuser
-
+# Run as root for volume permission compatibility
+WORKDIR /app
 ENV MODELSCOPE_CACHE=/models
 ENV SENSEVOICE_DEVICE=cpu
 ENV PYTHONUNBUFFERED=1
