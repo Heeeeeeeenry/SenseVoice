@@ -208,62 +208,53 @@ def stream_inference(input_wav, language):
         seg_dur = (end - start) / 16000
         yield f"🎙️ 实时转译中... ({i+1}/{total_segs} 段, {seg_dur:.1f}s)\n{'─'*40}\n{combined}\n{'─'*40}\n⏱️ 总时长: {duration:.1f}秒"
     
-    # 最终结果
+    # 最终结果 — LLM 纠错
     final = "\n".join(f"[{j+1}] {t}" for j, t in enumerate(texts))
-    corrected = correct_text(final)
+    yield f"🎙️ 正在 AI 纠错...\n{'─'*40}\n{final}\n{'─'*40}"
+    corrected = llm_correct_text(final)
     yield f"✅ 转译完成（共 {len(texts)} 段 | {duration:.1f}秒）\n{'─'*40}\n{corrected}"
 
 
-# ========== 文本纠错 ==========
-def correct_text(text):
-    """基于规则和上下文的文本纠错"""
-    # 去除单独的句号/标点残片
-    text = text.replace("\n。", "").replace("\n，", "").replace("\n！", "").replace("\n？", "")
+# ========== LLM 文本纠错 ==========
+def llm_correct_text(text):
+    """使用 DeepSeek LLM 纠正 ASR 识别错误"""
+    import json as json_mod
+    import urllib.request
     
-    # 去除 VAD 分段标记 [N]
-    import re as re_mod
-    text = re_mod.sub(r'\[\d+\] ', '', text)
-    text = re_mod.sub(r'\[\d+\]', '', text)
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return text  # no key, return as-is
     
-    # 常见同音错词修正（歌曲场景）
-    corrections = {
-        "雇勇": "孤勇",
-        "林黛": "领带",
-        "如一标": "如目标",
-        "那的头发": "那时的我",
-        "绝不平庸": "绝不普通",
-        "团我眼睛": "团火眼睛",
-        "人海理": "人海里",
-        "敢哭敢笑": "敢哭敢笑",
-        "燃少过": "燃烧过",
-        "在一宙": "在宇宙",
-        "多少回": "多少回",
-        "来点分岔": "那天分岔",
-        "出口告诉": "出口告诉",
-        "别为谁": "别为谁",
-        "算陷入梦": "算陷入梦",
-        "团伙眼": "团火焰",
-        "起手埋葬": "亲手埋葬",
-        "从新快乐": "重新快乐",
-        "情是浮躁": "情绪浮躁",
-        "刀结冰": "都结冰",
-        "奉献一句": "逢人一句",
-        "拼命天一": "拼命添衣",
-        "爱情我": "曾经我",
-        "台上的树": "躺在那数",
-        "失合": "适合",
-        "可心": "可心",
-        "一生的漫长": "一生的漫长",
-        "多想为了": "多想为了",
-        "盛下留后": "盛夏午后",
-        "燃烧过的宇宙": "燃烧过的宇宙",
-        "眼睛手": "眼睛守",
-    }
+    prompt = (
+        "你是一个中文语音识别纠错助手。请纠正以下ASR识别文本中的错误，"
+        "输出连贯、通顺的中文。只输出纠正后的文本，不要任何解释。\n\n"
+        f"原文：\n{text}"
+    )
     
-    for wrong, right in corrections.items():
-        text = text.replace(wrong, right)
+    body = json_mod.dumps({
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000,
+        "temperature": 0.1,
+    }).encode("utf-8")
     
-    return text.strip()
+    req = urllib.request.Request(
+        "https://api.deepseek.com/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json_mod.loads(resp.read())
+            content = result["choices"][0]["message"]["content"].strip()
+            return content if content else text
+    except Exception as e:
+        print(f"[LLM correct] error: {e}")
+        return text  # fallback to original
 
 # ========== Gradio UI ==========
 HTML_STREAMING = """
