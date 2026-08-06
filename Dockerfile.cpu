@@ -1,5 +1,5 @@
 # ============================================================
-# SenseVoice STT — CPU 模式（无 GPU，适用于 macOS / 开发环境）
+# SenseVoice STT — CPU 模式（ARM64，离线可用）
 # ============================================================
 FROM python:3.10-slim
 
@@ -12,9 +12,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements-cpu.txt requirements.txt
-RUN pip install --no-cache-dir torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir modelscope huggingface huggingface_hub funasr numpy gradio fastapi
+# 安装 Python 依赖（ARM64 兼容的 PyTorch 2.5.1 CPU 版，torch 和 torchaudio 必须精确配对，禁止用 >=）
+RUN pip install --no-cache-dir \
+    torch==2.5.1 \
+    torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# 核心 ASR 依赖
+RUN pip install --no-cache-dir \
+    modelscope>=1.22.0 \
+    huggingface_hub \
+    funasr>=1.1.3 \
+    numpy \
+    gradio \
+    fastapi>=0.111.1 \
+    uvicorn \
+    soundfile \
+    websockets
+
+# 补充缺失模块
+RUN pip install --no-cache-dir \
+    silero_vad \
+    einops
+
+# 预下载模型文件（离线环境不需要联网）
+COPY download_models.py /app/
+RUN python3 /app/download_models.py
 
 COPY . .
 
@@ -26,7 +49,7 @@ ENV PYTHONUNBUFFERED=1
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 
-EXPOSE 7860
+EXPOSE 7860 7861 9100
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
