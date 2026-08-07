@@ -33,7 +33,9 @@ RUN pip install --no-cache-dir \
 # 补充缺失模块
 RUN pip install --no-cache-dir \
     silero_vad \
-    einops
+    einops \
+    asr_decoder \
+    online_fbank
 
 # 预下载模型文件（离线环境不需要联网）
 COPY download_models.py /app/
