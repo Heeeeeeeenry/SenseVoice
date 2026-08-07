@@ -1,5 +1,5 @@
 # ============================================================
-# SenseVoice STT — CPU 模式（ARM64，离线可用）
+# SenseVoice STT — CPU 模式（多架构：linux/amd64 + linux/arm64，离线可用）
 # ============================================================
 FROM python:3.10-slim
 
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 安装 Python 依赖（ARM64 兼容的 PyTorch 2.5.1 CPU 版，torch 和 torchaudio 必须精确配对，禁止用 >=）
+# 安装 Python 依赖（多架构 CPU 版，torch 和 torchaudio 必须精确配对，禁止用 >=）
 RUN pip install --no-cache-dir \
     torch==2.5.1 \
     torchaudio==2.5.1 \
