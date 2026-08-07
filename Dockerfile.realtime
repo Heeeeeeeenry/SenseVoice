@@ -1,0 +1,30 @@
+# Realtime STT WebSocket Service
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# System deps for audio + build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 libsndfile1-dev \
+    gcc g++ python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps (CPU-only torch for smaller image)
+COPY requirements-realtime.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r requirements-realtime.txt
+
+# Application code
+COPY model.py /app/model.py
+COPY utils/ /app/utils/
+COPY streaming_sensevoice/ ./streaming_sensevoice/
+COPY stream_asr/ ./stream_asr/
+COPY realtime_ws_server.py .
+
+# Model cache volume
+VOLUME /models
+ENV MODELSCOPE_CACHE=/models
+
+EXPOSE 9100
+
+CMD ["python", "realtime_ws_server.py"]

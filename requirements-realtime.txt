@@ -1,0 +1,11 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+websockets>=12.0
+numpy>=1.26.0
+soundfile>=0.12.0
+silero-vad>=6.0.0
+asr-decoder>=0.1.0
+online-fbank>=0.0.4
+funasr>=1.3.0
+torch==2.3.0
+torchaudio==2.3.0

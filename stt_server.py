@@ -8,6 +8,8 @@ SenseVoice 独立转录服务 — 同步 + 流式逐句输出
 
 import os, re, sys, tempfile, json, cgi, io
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from threading import Condition
 
 import numpy as np
 import soundfile as sf
@@ -31,6 +33,159 @@ vad_model = AutoModel(
     disable_update=True,
 )
 print("Models ready", file=sys.stderr, flush=True)
+
+# ========== Resource guard ==========
+_CGROUP_LIMIT_PATHS = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+_CGROUP_USAGE_PATHS = (
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+)
+
+def _read_int(path):
+    try:
+        value = open(path).read().strip()
+        if value == "max": return None
+        return int(value)
+    except Exception:
+        return None
+
+def _read_mem_available_bytes():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+def _memory_snapshot():
+    limit = next((v for v in (_read_int(p) for p in _CGROUP_LIMIT_PATHS) if v), None)
+    usage = next((v for v in (_read_int(p) for p in _CGROUP_USAGE_PATHS) if v is not None), None)
+    host_available = _read_mem_available_bytes()
+    cgroup_available = None
+    if limit and usage is not None and limit < (1 << 60):
+        cgroup_available = max(0, limit - usage)
+    available_values = [v for v in (cgroup_available, host_available) if v is not None]
+    return {
+        "limit": limit,
+        "usage": usage,
+        "host_available": host_available,
+        "available": min(available_values) if available_values else None,
+    }
+
+def _bytes_to_mb(value):
+    if value is None: return None
+    return round(value / 1024 / 1024, 1)
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def calculate_max_concurrent(snapshot=None):
+    """Calculate startup STT inference concurrency.
+
+    STT_MAX_CONCURRENT can be:
+      - a positive integer: fixed limit, used as-is
+      - "auto"/empty: derive from available memory
+    """
+    raw = os.environ.get("STT_MAX_CONCURRENT", "auto").strip().lower()
+    if raw and raw != "auto":
+        try:
+            fixed = int(raw)
+            if fixed > 0:
+                return fixed
+        except Exception:
+            pass
+
+    snapshot = snapshot or _memory_snapshot()
+    available = snapshot.get("available")
+    mem_per_job_mb = _env_int("STT_MEM_PER_JOB_MB", 1536)
+    reserved_mb = _env_int("STT_RESERVED_MB", 2048)
+    hard_max = _env_int("STT_HARD_MAX_CONCURRENT", 8)
+    min_concurrent = _env_int("STT_MIN_CONCURRENT", 1)
+    fallback = _env_int("STT_FALLBACK_CONCURRENT", 3)
+
+    if available is None or mem_per_job_mb <= 0:
+        return max(min_concurrent, min(fallback, hard_max))
+
+    usable_mb = max(0, int(available / 1024 / 1024) - reserved_mb)
+    calculated = usable_mb // mem_per_job_mb
+    calculated = max(min_concurrent, calculated)
+    calculated = min(calculated, hard_max)
+    return calculated
+
+def capacity_snapshot():
+    snapshot = _memory_snapshot()
+    suggested = calculate_max_concurrent(snapshot)
+    limiter_status = _inference_limiter.status() if _inference_limiter else {"active": 0, "limit": suggested}
+    return {
+        "success": True,
+        "suggested_concurrent": suggested,
+        "active": limiter_status["active"],
+        "limit": limiter_status["limit"],
+        "memory": {k: _bytes_to_mb(v) for k, v in snapshot.items()},
+        "policy": {
+            "max_concurrent": os.environ.get("STT_MAX_CONCURRENT", "auto"),
+            "mem_per_job_mb": _env_int("STT_MEM_PER_JOB_MB", 1536),
+            "reserved_mb": _env_int("STT_RESERVED_MB", 2048),
+            "hard_max_concurrent": _env_int("STT_HARD_MAX_CONCURRENT", 8),
+        },
+    }
+
+def refresh_inference_limit():
+    suggested = calculate_max_concurrent()
+    if _inference_limiter:
+        _inference_limiter.resize(suggested)
+    return suggested
+
+def ensure_resource_available():
+    """Return (ok, snapshot, message). Reject before OOM instead of crashing."""
+    snapshot = _memory_snapshot()
+    min_available_mb = int(os.environ.get("STT_MIN_AVAILABLE_MB", "2048"))
+    max_usage_pct = float(os.environ.get("STT_MAX_MEMORY_PCT", "85"))
+    available = snapshot.get("available")
+    if available is not None and available < min_available_mb * 1024 * 1024:
+        return False, snapshot, f"STT资源不足：可用内存约 {_bytes_to_mb(available)}MB，低于安全阈值 {min_available_mb}MB"
+    limit, usage = snapshot.get("limit"), snapshot.get("usage")
+    if limit and usage is not None and limit < (1 << 60):
+        usage_pct = usage / limit * 100
+        if usage_pct >= max_usage_pct:
+            return False, snapshot, f"STT资源不足：容器内存使用率 {usage_pct:.1f}% >= {max_usage_pct:.1f}%"
+    return True, snapshot, ""
+
+def send_overloaded(handler, stream=False):
+    ok, snapshot, message = ensure_resource_available()
+    if ok: return False
+    payload = {
+        "success": False,
+        "error": message,
+        "retry_after": 30,
+        "memory": {k: _bytes_to_mb(v) for k, v in snapshot.items()},
+    }
+    print(f"[STT] reject overload: {payload}", file=sys.stderr, flush=True)
+    if stream:
+        handler.send_response(503)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Retry-After", "30")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.end_headers()
+        handler.wfile.write(sse_event("error", {"message": message, "retry_after": 30}))
+        handler.wfile.write(sse_event("done", {}))
+    else:
+        resp = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        handler.send_response(503)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Retry-After", "30")
+        handler.send_header("Content-Length", str(len(resp)))
+        handler.end_headers()
+        handler.wfile.write(resp)
+    return True
 
 # ========== ASR helpers ==========
 def format_str_v3(s):
@@ -104,12 +259,15 @@ def transcribe_sync(audio_path):
     segments = vad_segment(audio)
     if not segments: return "未检测到有效语音"
     lines = []
-    for start, end in segments:
-        res = asr_model.generate(input=audio[start:end], language="auto", use_itn=True, batch_size_s=60)
-        if res and res[0].get("text"):
-            text = format_str_v3(res[0]["text"]).strip().rstrip("。！？；，")
-            text = re.sub(r'<\|[^>]+\|>', '', text)
-            if sum(1 for c in text if '\u4e00' <= c <= '\u9fff') >= 3: lines.append(text)
+    # 每次推理前刷新并发窗口，运行中可随内存水位动态收缩/扩张
+    refresh_inference_limit()
+    with _inference_limiter:
+        for start, end in segments:
+            res = asr_model.generate(input=audio[start:end], language="auto", use_itn=True, batch_size_s=60)
+            if res and res[0].get("text"):
+                text = format_str_v3(res[0]["text"]).strip().rstrip("。！？；，")
+                text = re.sub(r'<\|[^>]+\|>', '', text)
+                if sum(1 for c in text if '\u4e00' <= c <= '\u9fff') >= 3: lines.append(text)
     raw_text = "\n".join(lines)
     if not raw_text: return "未识别出有效文本"
     return smart_correct_paragraph(raw_text, enable_llm=True)
@@ -124,15 +282,18 @@ def transcribe_streaming(audio, wfile):
         wfile.write(sse_event("done", {})); return
     total = len(segments)
     lines = []
-    for i, (start, end) in enumerate(segments):
-        res = asr_model.generate(input=audio[start:end], language="auto", use_itn=True, batch_size_s=60)
-        if res and res[0].get("text"):
-            text = format_str_v3(res[0]["text"]).strip().rstrip("。！？；，")
-            text = re.sub(r'<\|[^>]+\|>', '', text)
-            if sum(1 for c in text if '\u4e00' <= c <= '\u9fff') >= 3:
-                lines.append(text)
-                wfile.write(sse_event("chunk", {"text": text, "index": i, "total": total}))
-                wfile.flush()
+    # 每次推理前刷新并发窗口，运行中可随内存水位动态收缩/扩张
+    refresh_inference_limit()
+    with _inference_limiter:
+        for i, (start, end) in enumerate(segments):
+            res = asr_model.generate(input=audio[start:end], language="auto", use_itn=True, batch_size_s=60)
+            if res and res[0].get("text"):
+                text = format_str_v3(res[0]["text"]).strip().rstrip("。！？；，")
+                text = re.sub(r'<\|[^>]+\|>', '', text)
+                if sum(1 for c in text if '\u4e00' <= c <= '\u9fff') >= 3:
+                    lines.append(text)
+                    wfile.write(sse_event("chunk", {"text": text, "index": i, "total": total}))
+                    wfile.flush()
     if not lines:
         wfile.write(sse_event("error", {"message": "未识别出有效文本"}))
         wfile.write(sse_event("done", {})); return
@@ -140,7 +301,52 @@ def transcribe_streaming(audio, wfile):
     wfile.write(sse_event("result", {"text": corrected}))
     wfile.write(sse_event("done", {}))
 
-# ========== HTTP Server ==========
+# ========== Threading server with concurrency limit ==========
+# ThreadingMixIn 让每个请求在独立线程中处理
+# _inference_limiter 限制同时进行模型推理的线程数，防止 CPU/内存打爆
+class ThreadingTranscribeServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True  # 主进程退出时自动清理线程
+
+
+class DynamicLimiter:
+    def __init__(self, limit):
+        self.limit = max(1, int(limit))
+        self.active = 0
+        self.cond = Condition()
+
+    def resize(self, limit):
+        limit = max(1, int(limit))
+        with self.cond:
+            self.limit = limit
+            self.cond.notify_all()
+
+    def acquire(self):
+        with self.cond:
+            while self.active >= self.limit:
+                self.cond.wait()
+            self.active += 1
+
+    def release(self):
+        with self.cond:
+            self.active = max(0, self.active - 1)
+            self.cond.notify_all()
+
+    def status(self):
+        with self.cond:
+            return {"active": self.active, "limit": self.limit}
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
+_inference_limiter = None  # 在 main() 中初始化
+
+
 class TranscribeHandler(BaseHTTPRequestHandler):
     def _read_file(self):
         """Parse multipart upload, save to temp file, return path"""
@@ -162,8 +368,23 @@ class TranscribeHandler(BaseHTTPRequestHandler):
         tmp.close()
         return tmp.name
 
+    def do_GET(self):
+        if self.path in ("/capacity", "/healthz"):
+            if self.path == "/capacity":
+                refresh_inference_limit()
+            payload = capacity_snapshot()
+            resp = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+        self.send_error(404)
+
     def do_POST(self):
         if self.path == "/transcribe":
+            if send_overloaded(self): return
             tmp_path = self._read_file()
             if tmp_path is None: return
             try:
@@ -184,6 +405,7 @@ class TranscribeHandler(BaseHTTPRequestHandler):
                 os.unlink(tmp_path)
 
         elif self.path == "/transcribe_stream":
+            if send_overloaded(self, stream=True): return
             tmp_path = self._read_file()
             if tmp_path is None: return
             try:
@@ -210,9 +432,18 @@ class TranscribeHandler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {args[0]}", file=sys.stderr, flush=True)
 
 def main():
+    global _inference_limiter
+
     port = int(os.environ.get("STT_API_PORT", "7861"))
-    server = HTTPServer(("0.0.0.0", port), TranscribeHandler)
-    print(f"STT API server listening on port {port}", file=sys.stderr, flush=True)
+
+    # 并发推理数：STT_MAX_CONCURRENT=auto 时根据可用内存自动估算；
+    # 设置为数字时使用固定值，便于运维强制覆盖。
+    max_concurrent = calculate_max_concurrent()
+    _inference_limiter = DynamicLimiter(max_concurrent)
+
+    server = ThreadingTranscribeServer(("0.0.0.0", port), TranscribeHandler)
+    print(f"STT API server listening on port {port} (max_concurrent={max_concurrent})",
+          file=sys.stderr, flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
